@@ -1,0 +1,319 @@
+# CircleCI 2.0 configuration file
+#
+# Check https://circleci.com/docs/2.0/language-ruby/ for more details
+# Also check:
+# https://circleci.com/docs/2.0/configuration-reference/
+# https://circleci.com/docs/2.0/circleci-images/
+
+version: 2
+defaults:
+  context: &context org-global
+jobs:
+  checkout_and_bundle:
+      docker:
+        - image: cimg/ruby:2.7.5-node
+      working_directory: ~/app
+      steps:
+        - checkout
+        - save_cache:
+            key: v2-repo-{{ .Environment.CIRCLE_SHA1 }}
+            paths:
+              - ~/app
+        - restore_cache:
+            keys:
+              - v2-bundle-{{ checksum "Gemfile.lock" }}
+        - run:
+            name: Set Jfrog Creds
+            command: |
+              bundle config wework.jfrog.io $ARTIFACTORY_USER:$ARTIFACTORY_APIKEY
+        - run:
+            name: Configure Bundler
+            command:  |
+              gem install bundler -v $(tail -1 Gemfile.lock | tr -d " ")
+        - run:
+            name: Bundle Install
+            command: |
+              bundle check --path vendor/bundle || bundle install --path vendor/bundle
+        - save_cache:
+            key: v2-bundle-{{ checksum "Gemfile.lock" }}
+            paths:
+              - ~/app/vendor/bundle
+  brakeman:
+    docker:
+      - image: cimg/ruby:2.5.7
+    working_directory: ~/app
+    steps:
+      - restore_cache:
+          keys:
+            - v2-repo-{{ .Environment.CIRCLE_SHA1 }}
+      - run:
+          name: Brakeman Install
+          command: gem install brakeman
+      - run:
+          name: Brakeman
+          command: brakeman -z
+  test:
+    parallelism: 20
+    working_directory: ~/app
+    docker:
+      - image: cimg/ruby:2.7.5-node
+        environment:
+          BUNDLE_JOBS: 3
+          BUNDLE_RETRY: 3
+          BUNDLE_PATH: vendor/bundle
+          PGHOST: 127.0.0.1
+          PGUSER: rooms
+          RAILS_ENV: test
+          FRONTEND_URI: https://staging-members.wework.com/rooms
+          FRONTEND_URI_WORKSPACES: https://members.wework.com/workspaces
+      - image: circleci/postgres:11.3-alpine
+        environment:
+          POSTGRES_USER: rooms
+          POSTGRES_DB: conference-rooms_test
+          POSTGRES_PASSWORD: ""
+      - image: circleci/redis:3.2-alpine
+      - image: rabbitmq
+    steps:
+      - restore_cache:
+          keys:
+            - v2-repo-{{ .Environment.CIRCLE_SHA1 }}
+      - restore_cache:
+          keys:
+            - v2-bundle-{{ checksum "Gemfile.lock" }}
+      - run: bundle --path vendor/bundle
+      - run:
+          name: Wait for db
+          command: dockerize -wait tcp://localhost:5432 -timeout 1m
+      - run:
+          name: Database setup
+          command: bundle exec rake db:create db:schema:load
+      - run:
+          name: Rspec
+          command: |
+            CIRCLE_BUILD_NUM=$CIRCLE_WORKFLOW_ID bundle exec rspec --profile 10 \
+              --format RspecJunitFormatter \
+              --out test_results/rspec.xml \
+              --format progress \
+              $(circleci tests glob "spec/**/*_spec.rb" | circleci tests split --split-by=timings)
+      # Save test results for timing analysis
+      - store_test_results:
+          path: test_results
+
+  rubocop:
+    working_directory: ~/app
+    docker:
+      - image: cimg/ruby:2.7.5-node
+    steps:
+      - restore_cache:
+          keys:
+            - v2-repo-{{ .Environment.CIRCLE_SHA1 }}
+      - restore_cache:
+          keys:
+            - v2-bundle-{{ checksum "Gemfile.lock" }}
+      - run: bundle --path vendor/bundle
+      - run: bundle exec rubocop
+
+  build_and_push_docker:
+    working_directory: /root/project
+    docker:
+      - image: quay.io/wework/wectl-bin:latest
+        auth:
+          username: $DOCKER_USER
+          password: $DOCKER_PASSWD
+    environment:
+      DOCKER_REGISTRY: "quay.io/wework"
+      DOCKER_REPOSITORY: "quay.io/wework/rooms"
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run:
+          name: Docker Login
+          command: |
+            echo $DOCKER_PASSWD | docker login $DOCKER_REGISTRY -u $DOCKER_USER --password-stdin
+      - run:
+          name: Docker Image - Build
+          command: |
+            tag=$(echo $CIRCLE_BRANCH | sed "s|/|-|g")
+            docker build . -t quay.io/wework/rooms:$tag \
+            --build-arg ARTIFACTORY_USER=$ARTIFACTORY_USER \
+            --build-arg ARTIFACTORY_APIKEY=$ARTIFACTORY_APIKEY \
+            --build-arg GIT_SHA=$CIRCLE_SHA1
+      - run:
+          name: Docker Push
+          command: |
+            tag=$(echo $CIRCLE_BRANCH | sed "s|/|-|g")
+            docker tag quay.io/wework/rooms:$tag quay.io/wework/rooms:$CIRCLE_SHA1
+            docker push quay.io/wework/rooms:$CIRCLE_SHA1
+            if [ $tag == 'master' ]; then
+              docker push quay.io/wework/rooms:$tag
+            fi
+  deploy_wek8s_staging:
+    docker:
+      - image: quay.io/wework/wectl-bin:latest
+        auth:
+          username: $DOCKER_USER
+          password: $DOCKER_PASSWD
+    steps:
+      - checkout
+      - run:
+          name: "Deploy to wek8s-dev-us-west"
+          command: |
+            if [ ! -z $WECTL_DEPLOY_DEV_KEY ]; then
+              /usr/bin/wectl deploy -a rooms -t wek8s-dev-us-west -v $CIRCLE_SHA1 -k $WECTL_DEPLOY_DEV_KEY
+            else
+              echo "No WECTL_DEPLOY_DEV_KEY defined, not deploying automatically; see https://github.com/WeConnect/wectl#automated-deploys"
+            fi
+  deploy_wek8s_feature:
+    docker:
+      - image: quay.io/wework/wectl-bin:latest
+        auth:
+          username: $DOCKER_USER
+          password: $DOCKER_PASSWD
+    steps:
+      - checkout
+      - run:
+          name: "Deploy to feature branch"
+          command: |
+            if [ ! -z $WECTL_DEPLOY_DEV_KEY ]; then
+            FEATURE=`echo $CIRCLE_BRANCH | tr '/' '-'`
+            /usr/bin/wectl env import vault -a rooms -t wek8s-dev-us-west -b $FEATURE -k $WECTL_DEPLOY_DEV_KEY \
+            secret/rooms-dev/wek8s-dev-us-west/rooms/wectl
+            /usr/bin/wectl deploy -a rooms -t wek8s-dev-us-west -b $FEATURE -v $CIRCLE_SHA1 -k $WECTL_DEPLOY_DEV_KEY
+            echo "Deploy to feature branch complete, migrations are NOT run"
+            else
+              echo "No WECTL_DEPLOY_DEV_KEY defined, not deploying automatically; see https://github.com/WeConnect/wectl#automated-deploys"
+            fi
+  run_migrations_staging:
+    docker:
+      - image: quay.io/wework/wectl-bin:latest
+        auth:
+          username: $DOCKER_USER
+          password: $DOCKER_PASSWD
+    steps:
+      - checkout
+      - run:
+          name: "Run db migrations in staging"
+          command: |
+            /usr/bin/wectl deploy -a rooms -t wek8s-dev-us-west -v $CIRCLE_SHA1 -d db-migrate -k $WECTL_DEPLOY_DEV_KEY
+  run_migrations_prod:
+    docker:
+      - image: quay.io/wework/wectl-bin:latest
+        auth:
+          username: $DOCKER_USER
+          password: $DOCKER_PASSWD
+    steps:
+      - checkout
+      - run:
+          name: "Run db migrations in prod"
+          command: |
+            /usr/bin/wectl deploy -a rooms -t wek8s-prod-us-east -v $CIRCLE_SHA1 -d db-migrate -k $WECTL_DEPLOY_KEY
+  deploy_wek8s_prod:
+    docker:
+      - image: quay.io/wework/wectl-bin:latest
+        auth:
+          username: $DOCKER_USER
+          password: $DOCKER_PASSWD
+    steps:
+      - checkout
+      - run:
+          name: "Deploy to wek8s-prod-us-east"
+          command: |
+            if [ ! -z $WECTL_DEPLOY_KEY ]; then
+              /usr/bin/wectl deploy -a rooms -t wek8s-prod-us-east -v $CIRCLE_SHA1 -k $WECTL_DEPLOY_KEY
+            else
+              echo "No WECTL_DEPLOY_DEV_KEY defined, not deploying automatically; see https://github.com/WeConnect/wectl#automated-deploys"
+            fi
+workflows:
+  version: 2
+  rooms_build_lint_test:
+    jobs:
+      - checkout_and_bundle:
+          context: *context
+      - test:
+          context: *context
+          requires:
+            - checkout_and_bundle
+      - rubocop:
+          context: *context
+          requires:
+            - checkout_and_bundle
+          filters:
+            branches:
+              ignore:
+                - master
+      - brakeman:
+          context: *context
+          requires:
+            - checkout_and_bundle
+          filters:
+            branches:
+              ignore:
+                - master
+      - build_and_push_docker:
+          context: *context
+          requires:
+            - checkout_and_bundle
+      - approve_feature_deployment:
+          type: approval
+          requires:
+            - test
+            - brakeman
+            - rubocop
+            - build_and_push_docker
+          filters:
+            branches:
+              ignore:
+                - master
+      - approve_staging_deployment:
+          type: approval
+          requires:
+            - test
+            - brakeman
+            - rubocop
+            - build_and_push_docker
+          filters:
+            branches:
+              ignore:
+                - master
+      - deploy_wek8s_staging:
+          context: *context
+          requires:
+            - run_migrations_staging
+          filters:
+            branches:
+              ignore:
+                - master
+      - deploy_wek8s_feature:
+          context: *context
+          requires:
+            - approve_feature_deployment
+          filters:
+            branches:
+              ignore:
+                - master
+      - run_migrations_prod:
+          context: *context
+          requires:
+            - test
+            - build_and_push_docker
+          filters:
+            branches:
+              only:
+                - master
+      - run_migrations_staging:
+          context: *context
+          requires:
+            - approve_staging_deployment
+          filters:
+            branches:
+              ignore:
+                - master
+      - deploy_wek8s_prod:
+          context: *context
+          requires:
+            - run_migrations_prod
+          filters:
+            branches:
+              only:
+                - master
